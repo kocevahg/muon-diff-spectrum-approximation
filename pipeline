@@ -1,0 +1,562 @@
+"""
+Поток: загрузка БД, выборки отбора, подгонка, рейтинг.
+
+ВЫБОРКИ ОТБОРА (диапазон угла/импульса, единый для всех моделей)
+  A  - θ ≤ 70°, p ≥ 100/cosθ: область Гайссера
+  B  - θ ≥ 70°, p ≥ 1 ГэВ/c: окологоризонтальная область
+  B85- θ = 70…85°, p ≥ 1 ГэВ/c: область Богдановой
+  C  - все углы, p ≥ 1 ГэВ/c: полная база
+
+  Выборки B, B85, C: порог 8 точек.
+  Выборки А: порог 4 точки.
+
+ЕДИНЫЕ ПРАВИЛА (одинаковы во всех выборках и для всех моделей)
+  - набор данных = пара (experiment, theta_center);
+  - точка-выброс Kellogg 30°, p = 1067 ГэВ/c удаляется;
+  - нулевые и отсутствующие погрешности заменяются на 10 % интенсивности;
+  - подгонка методом наименьших квадратов с absolute_sigma=True.
+
+Статистика сравнения моделей - χ²/dof (медиана по наборам выборки и
+глобальное Σχ²/Σdof);
+"""
+import argparse
+import os
+import sqlite3
+import sys
+import warnings
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+
+import models as M
+
+# ── единые правила отбора ────────────────────────────────────────────────
+KELLOGG_OUTLIER_P = 1067.0        # ГэВ/c
+KELLOGG_OUTLIER_TOL = 1.0
+ERROR_FLOOR = 0.10                # доля интенсивности при σ = 0
+
+TIERS = {
+    "A":   dict(th_min=0.0,  th_max=70.0, p_min="gaisser", min_pts=4),
+    "B":   dict(th_min=70.0, th_max=90.0, p_min=1.0,       min_pts=8),
+    "B85": dict(th_min=70.0, th_max=85.0, p_min=1.0,       min_pts=8),
+    "C":   dict(th_min=0.0,  th_max=90.0, p_min=1.0,       min_pts=8),
+}
+
+MODELS = ["reyna", "shukla", "bogdanova", "tang", "gaisser", "reyna_fixed"]
+
+# Свободные параметры каждой модели
+PARAM_NAMES = {
+    "gaisser":     ["A_G", "gamma"],
+    "tang":        ["A_T", "gamma"],
+    "shukla":      ["I0", "n", "E0"],
+    "reyna":       ["A", "a0", "a1", "a2", "a3"],
+    "reyna_fixed": ["A"],
+    "bogdanova":   ["A0", "gamma"],
+}
+
+# ── объединение по импульсу ──────────────────────────────────────────────
+MERGE_GROUPS = [
+    {"members": [("okayama", 30.0), ("l3+c", 30.0)]},
+    {"members": [("nottingham", 30.0), ("kellogg", 30.0)]},
+    {"members": [("nottingham", 45.0), ("l3+c", 45.0)]},
+    {"members": [("mutron", 88.0), ("deis", 88.5)]},
+]
+MERGE_ANGLE_TOL = 2.0          # допуск по углу, град
+
+
+# ── загрузка данных ──────────────────────────────────────────────────────
+def load_datasets(db_path, drop_outlier=True):
+    """Читает БД (muon_data.db) и возвращает список наборов.
+       Набор данных = (experiment, theta_center)
+       Погрешность = total_error (см. data_dictionary в самой БД);
+
+    drop_outlier=False отключает отбрасывание точки Kellogg θ = 30°, p = 1067 ГэВ/c.
+    """
+
+    # Загрузка данных
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql(
+        "SELECT experiment, theta_center AS angle, momentum, intensity, "
+        "total_error AS error FROM muon_data ORDER BY experiment, "
+        "theta_center, momentum", conn)
+    conn.close()
+
+    # Сортировка данных
+    out = []
+    for (name, theta), g in df.groupby(["experiment", "angle"], sort=True):
+        g = g.sort_values("momentum")
+        # Удаляет выброс у Kellogg
+        if (drop_outlier and name.lower().startswith("kellogg")
+                and abs(theta - 30.0) < 1):
+            g = g[np.abs(g.momentum - KELLOGG_OUTLIER_P) > KELLOGG_OUTLIER_TOL]
+        sig = g.error.to_numpy(float).copy()
+        I = g.intensity.to_numpy(float)
+        bad = ~np.isfinite(sig) | (sig <= 0)
+        # Замена плохих ошибок
+        sig[bad] = ERROR_FLOOR * np.maximum(I[bad], 1e-30)
+        out.append(dict(name=f"{name} θ={theta:.1f}°",
+                        theta=float(theta),
+                        p=g.momentum.to_numpy(float),
+                        I=I, sig=sig))
+    return merge_datasets(out)
+
+# Из имени убирается часть с углом
+def _find_member(pool, name_sub, angle, tol):
+    for ds in pool:
+        base = ds["name"].split(" θ=")[0]
+        if name_sub.lower() in base.lower() and abs(ds["theta"] - angle) < tol:
+            return ds
+    return None
+
+# Объединяет сконфигурированные группы наборов в один
+def merge_datasets(datasets, groups=MERGE_GROUPS, tol=MERGE_ANGLE_TOL):
+    if not groups:
+        return datasets
+    pool, consumed, merged = list(datasets), set(), []
+    for group in groups:
+        members = []
+        for name_sub, angle in group["members"]:
+            ds = _find_member(pool, name_sub, angle, tol)
+            if ds is None:
+                members = []
+                break
+            members.append(ds)
+        if not members:
+            continue
+        label = group.get("label") or " + ".join(
+            m["name"].split(" θ=")[0] for m in members)
+        p = np.concatenate([m["p"] for m in members])
+        I = np.concatenate([m["I"] for m in members])
+        sig = np.concatenate([m["sig"] for m in members])
+        order = np.argsort(p)
+        theta = float(np.mean([m["theta"] for m in members]))
+        merged.append(dict(name=f"{label} θ={theta:.1f}°", theta=theta,
+                           p=p[order], I=I[order], sig=sig[order],
+                           merged=True))
+        consumed.update(id(m) for m in members)
+    leftover = [ds for ds in pool if id(ds) not in consumed]
+    return merged + leftover
+
+# Отбирает нужные наборы и точки перед фитированием
+def select(datasets, tier):
+    cfg = TIERS[tier]
+    sel = []
+    for ds in datasets:
+        th = ds["theta"]
+        if not (cfg["th_min"] <= th <= cfg["th_max"]):
+            continue
+        pmin = (100.0 / np.cos(np.deg2rad(th)) if cfg["p_min"] == "gaisser"
+                else cfg["p_min"])
+        m = ds["p"] >= pmin
+        if m.sum() < cfg["min_pts"]:
+            continue
+        sel.append(dict(name=ds["name"], theta=th, p=ds["p"][m],
+                        I=ds["I"][m], sig=ds["sig"][m]))
+    return sel
+
+
+# ── подгонка ─────────────────────────────────────────────────────────────
+def _model_call(model, th, Ec=0.0):
+    """Возвращает f(p, *params) с фиксированным углом.
+
+    Для формы Шукла параметр E_c фиксируется наименьшим подгоняемым импульсом
+    набора (E_c = «обрезание данных»).
+    """
+    if model == "reyna_fixed":
+        return lambda p, A: M.reyna_fixed(p, th, A)
+    if model == "shukla":
+        return lambda p, I0, n, E0: M.shukla(p, th, I0, n, E0, Ec)
+    fn = getattr(M, model)
+    return lambda p, *q: fn(p, th, *q)
+
+# Задает начальные значения параметров (p0)
+# и допустимые границы (bounds) для фитирования модели (models.py)
+def _p0_bounds(model):
+    if model == "reyna_fixed":
+        return (M.REYNA_PUBLISHED[0],), ([1e-8], [1e2])
+    return (getattr(M, model.upper() + "_P0"),
+            getattr(M, model.upper() + "_BOUNDS"))[0], \
+           getattr(M, model.upper() + "_BOUNDS")
+
+# Подгонка одной модели к одному набору
+def fit_one(ds, model):
+    npar = M.NPAR[model]
+    dof = len(ds["p"]) - npar
+    if dof < 1:
+        return None
+    f = _model_call(model, ds["theta"], Ec=float(ds["p"].min()))
+    p0, bounds = _p0_bounds(model)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            popt, pcov = curve_fit(f, ds["p"], ds["I"], p0=p0, sigma=ds["sig"],
+                                absolute_sigma=True, bounds=bounds, maxfev=200000)
+    except Exception:
+        return None
+    pull = (ds["I"] - f(ds["p"], *popt)) / ds["sig"]
+    chi2 = float(np.sum(pull ** 2))
+    if not np.isfinite(chi2):
+        return None
+    with np.errstate(invalid="ignore"):
+        perr = np.sqrt(np.diag(pcov))
+    return dict(model=model, dataset=ds["name"], theta=ds["theta"],
+                n=len(ds["p"]), dof=dof, chi2=chi2, chi2_dof=chi2 / dof,
+                popt=popt, perr=perr, pull=pull, p=ds["p"])
+
+
+def eval_frozen(ds, model, params=None):
+    """
+    Ступень 0: все параметры фиксированы на опубликованных значениях.
+    Свободных параметров нет.
+    """
+    if params is None:
+        params = M.PUBLISHED[model]
+    f = _model_call(model, ds["theta"], Ec=float(ds["p"].min()))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        pred = np.asarray(f(ds["p"], *params), float)
+    if not np.all(np.isfinite(pred)) or np.any(pred <= 0):
+        return None
+    pull = (ds["I"] - pred) / ds["sig"]
+    chi2 = float(np.sum(pull ** 2))
+    if not np.isfinite(chi2):
+        return None
+    return dict(model=model, dataset=ds["name"], theta=ds["theta"],
+                n=len(ds["p"]), dof=len(ds["p"]), chi2=chi2,
+                chi2_dof=chi2 / len(ds["p"]), scale=1.0,
+                pull=pull, p=ds["p"], pred=pred)
+
+
+def fit_norm_only(ds, model, params=None):
+    """
+    Ступень 1: свободна только общая нормировка при опубликованной форме.
+    Модель берётся с опубликованными параметрами и умножается на скаляр s,
+    минимизирующий χ².
+    s = Σ(I·f/σ²) / Σ(f²/σ²).
+    """
+    fr = eval_frozen(ds, model, params)
+    if fr is None or len(ds["p"]) < 2:
+        return None
+    f, w = fr["pred"], 1.0 / ds["sig"] ** 2
+    denom = float(np.sum(f * f * w))
+    if denom <= 0:
+        return None
+    s = float(np.sum(ds["I"] * f * w) / denom)
+    if not np.isfinite(s) or s <= 0:
+        return None
+    dof = len(ds["p"]) - 1
+    pull = (ds["I"] - s * f) / ds["sig"]
+    chi2 = float(np.sum(pull ** 2))
+    if not np.isfinite(chi2) or dof < 1:
+        return None
+    return dict(model=model, dataset=ds["name"], theta=ds["theta"],
+                n=len(ds["p"]), dof=dof, chi2=chi2, chi2_dof=chi2 / dof,
+                scale=s, pull=pull, p=ds["p"], pred=s * f)
+
+
+LADDER = ["frozen", "norm", "free"]
+LADDER_RU = {"frozen": "опубликованные параметры",
+             "norm": "свободна нормировка",
+             "free": "полная подгонка"}
+
+
+def freedom_ladder(datasets, tier, models=tuple(M.PUBLISHED)):
+    """Три ступени свободы для каждой пары набор–форма.
+
+    Ступень 0 (frozen) — опубликованные параметры, χ²/n.
+    Ступень 1 (norm)   — свободна только нормировка, χ²/(n−1).
+    Ступень 2 (free)   — полная подгонка, χ²/(n−k).
+
+    """
+    rows = []
+    for ds in select(datasets, tier):
+        for m in models:
+            for stage, fn in (("frozen", eval_frozen),
+                              ("norm", fit_norm_only),
+                              ("free", lambda d, mm: fit_one(d, mm))):
+                r = fn(ds, m)
+                if r is None:
+                    continue
+                rows.append(dict(tier=tier, stage=stage, model=m,
+                                 dataset=ds["name"], theta=ds["theta"],
+                                 n=r["n"], dof=r["dof"], chi2=r["chi2"],
+                                 chi2_dof=r["chi2_dof"],
+                                 scale=r.get("scale", np.nan)))
+    return pd.DataFrame(rows)
+
+
+def ladder_summary(ladder, chi2_bad=10.0):
+    """Сводка лестницы: медиана χ²/dof, размах и доля выборок с χ²/dof > 10."""
+    rows = []
+    for (tier, stage, model), g in ladder.groupby(["tier", "stage", "model"]):
+        s = g.chi2_dof
+        rows.append(dict(tier=tier, stage=stage, model=model, k=len(s),
+                         median=float(s.median()),
+                         q1=float(s.quantile(0.25)), q3=float(s.quantile(0.75)),
+                         frac_bad=float(np.mean(s > chi2_bad))))
+    out = pd.DataFrame(rows)
+    out["stage"] = pd.Categorical(out["stage"], LADDER, ordered=True)
+    return out.sort_values(["tier", "model", "stage"]).reset_index(drop=True)
+
+# Проверка приведения единиц формы Шуклы.
+def shukla_unit_check(datasets, theta_max=30.0):
+    rows = []
+    for ds in select(datasets, "C"):
+        if ds["theta"] > theta_max:
+            continue
+        r = fit_one(ds, "shukla")
+        if r is None:
+            continue
+        I0, n, E0 = r["popt"]
+        Ec = float(np.min(ds["p"]))
+        rows.append(dict(dataset=ds["name"], theta=ds["theta"], p_min=Ec,
+                         I0_fit=I0, n=n, E0=E0,
+                         I0_gt1GeV_m2=I0 * ((E0 + Ec) / (E0 + 1.0)) ** (n - 1) * 1e4,
+                         I0_published_m2=70.7))
+    return pd.DataFrame(rows).sort_values(["theta", "dataset"]).reset_index(drop=True)
+
+
+WIDE_ANG_BINS = [(0, 30), (30, 60), (60, 70), (70, 78),
+                 (79, 82), (83, 85), (86, 90)]
+
+
+def frozen_bias(datasets, tier, models=tuple(M.PUBLISHED), by="angle"):
+    """
+       Медианное отношение модель/эксперимент для фиксированных форм.
+       Группировка по зенитному углу (by="angle", корзины WIDE_ANG_BINS)
+       или по импульсу (by="momentum", MOM_BINS).
+    """
+    recs = []
+    for ds in select(datasets, tier):
+        for m in models:
+            r = eval_frozen(ds, m)
+            if r is None:
+                continue
+            ratio = r["pred"] / np.asarray(ds["I"], float)
+            for pi, ri in zip(np.asarray(ds["p"], float), ratio):
+                recs.append(dict(model=m, theta=ds["theta"], p=pi, ratio=ri))
+    df = pd.DataFrame(recs)
+    bins = WIDE_ANG_BINS if by == "angle" else MOM_BINS
+    col = "theta" if by == "angle" else "p"
+    rows = []
+    for m, g in df.groupby("model"):
+        for lo, hi in bins:
+            sub = g[(g[col] >= lo) & (g[col] <= hi)]
+            if len(sub) == 0:
+                continue
+            rows.append(dict(tier=tier, model=m, bin_lo=lo, bin_hi=hi,
+                             n=len(sub), ratio_med=float(sub.ratio.median()),
+                             ratio_q1=float(sub.ratio.quantile(0.25)),
+                             ratio_q3=float(sub.ratio.quantile(0.75))))
+    return pd.DataFrame(rows)
+
+# Подгоняет все модели ко всем наборам выборки отбора
+def fit_tier(datasets, tier, models=MODELS, keep_pulls=False):
+    sel = select(datasets, tier)
+    rows, pulls = [], []
+    for ds in sel:
+        for m in models:
+            r = fit_one(ds, m)
+            if r is None:
+                continue
+            rows.append(dict(tier=tier, **{k: v for k, v in r.items()
+                                           if k not in ("popt", "perr", "pull", "p")}))
+            if keep_pulls:
+                pulls.append(pd.DataFrame(dict(
+                    tier=tier, model=m, dataset=ds["name"], theta=ds["theta"],
+                    p=r["p"], pull=r["pull"])))
+    df = pd.DataFrame(rows)
+    if keep_pulls:
+        return df, (pd.concat(pulls, ignore_index=True) if pulls
+                    else pd.DataFrame())
+    return df
+
+# Делает таблицу параметров, полученных при независимом
+# фитировании каждой модели к каждой выборке
+def param_table(datasets, tier, models=("tang", "shukla", "reyna", "bogdanova")):
+    """
+    Подогнанные параметры каждой формы по каждому набору выборки отбора.
+
+    Используется для диагностики: если параметризация
+    универсальна, её независимо подогнанные параметры не должны
+    систематически зависеть от угла - они должны разбрасываться вокруг
+    одного значения в пределах погрешностей подгонки. Систематический ход
+    параметра с θ означает, что форма компенсирует угловой недостаток
+    функциональной зависимости изменением коэффициента, а не описывает
+    данные фиксированным набором параметров.
+    """
+    rows = []
+    for ds in select(datasets, tier):
+        for m in models:
+            r = fit_one(ds, m)
+            if r is None:
+                continue
+            _, bounds = _p0_bounds(m)
+            lo = np.asarray(bounds[0], float)
+            hi = np.asarray(bounds[1], float)
+            span = np.where(np.isfinite(hi - lo), hi - lo, 1.0)
+            at_bound = ((np.abs(r["popt"] - lo) < 1e-6 * span) |
+                        (np.abs(r["popt"] - hi) < 1e-6 * span))
+            row = dict(tier=tier, model=m, dataset=ds["name"],
+                       theta=ds["theta"], n=r["n"], chi2_dof=r["chi2_dof"])
+            for name, val, err, hit in zip(PARAM_NAMES[m], r["popt"],
+                                           r["perr"], at_bound):
+                row[name] = val
+                row[name + "_err"] = err
+                row[name + "_at_bound"] = bool(hit)
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ── рейтинг ──────────────────────────────────────────────────────────────
+def ranking(fit_df):
+    """Медиана χ²/dof и глобальное Σχ²/Σdof для каждой модели."""
+    rows = []
+    for m, g in fit_df.groupby("model"):
+        s = g.set_index("dataset").chi2_dof
+        rows.append(dict(model=m, k=M.NPAR[m], n=len(g),
+                     median=float(np.median(s)),
+                     global_chi2_dof=float(g.chi2.sum() / g.dof.sum())))
+    return pd.DataFrame(rows).sort_values("median").reset_index(drop=True)
+
+
+# ── диагностика области применимости ─────────────────────────────────────
+MOM_BINS = [(1, 3), (3, 10), (10, 30), (30, 100), (100, 300),
+            (300, 1000), (1000, 3000), (3000, 30000)]
+ANG_BINS = [(70, 78), (79, 82), (83, 85), (86, 90)]
+
+
+def _diag(sub):
+    return dict(n=len(sub),
+                frac_pull_gt3=float(np.mean(np.abs(sub["pull"]) > 3)),
+                rms_pull=float(np.sqrt(np.mean(sub["pull"] ** 2))))
+
+
+def applicability_momentum(pulls, models=("tang", "shukla", "reyna", "bogdanova")):
+    """СКО нормированных остатков и доля |δ|>3 по корзинам импульса."""
+    rows = []
+    for m in models:
+        d = pulls[pulls.model == m]
+        for lo, hi in MOM_BINS:
+            s = d[(d.p >= lo) & (d.p < hi)]
+            if len(s) == 0:
+                continue
+            rows.append(dict(model=m, p_lo=lo, p_hi=hi, **_diag(s)))
+    return pd.DataFrame(rows)
+
+
+def applicability_angle(pulls, model="bogdanova"):
+    """То же по зенитного угла - для формы Богдановой."""
+    d = pulls[pulls.model == model]
+    rows = []
+    for lo, hi in ANG_BINS:
+        s = d[(d.theta >= lo) & (d.theta <= hi)]
+        if len(s) == 0:
+            continue
+        rows.append(dict(model=model, th_lo=lo, th_hi=hi, **_diag(s)))
+    return pd.DataFrame(rows)
+
+
+# ── точка входа ──────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--db", default="muon_data.db")
+    ap.add_argument("--out", default="out")
+    a = ap.parse_args()
+    os.makedirs(a.out, exist_ok=True)
+
+    datasets = load_datasets(a.db)
+    print(f"наборов в базе: {len(datasets)}, "
+          f"точек: {sum(len(d['p']) for d in datasets)}")
+
+    #Сохраняет рейтинг в CSV
+    all_fits, all_pulls = [], []
+    for tier in ("A", "B", "B85", "C"):
+        df, pl = fit_tier(datasets, tier, keep_pulls=True)
+        all_fits.append(df)
+        all_pulls.append(pl)
+        r = ranking(df)
+        r.to_csv(os.path.join(a.out, f"ranking_{tier}.csv"), index=False)
+        print(f"\nвыборка {tier}: {df.dataset.nunique()} наборов, "
+              f"{df.dof.sum() + df.n.sum():.0f} степеней+точек")
+        print(r.to_string(index=False))
+
+    # Сохраняет хи2 в CSV
+    fits = pd.concat(all_fits, ignore_index=True)
+    pulls = pd.concat(all_pulls, ignore_index=True)
+    fits.to_csv(os.path.join(a.out, "per_dataset_chi2.csv"), index=False)
+
+    # Область применимости по импульсу (для C)
+    pc = pulls[pulls.tier == "C"]
+    applicability_momentum(pc).to_csv(
+        os.path.join(a.out, "applicability_momentum.csv"), index=False)
+
+    # Область применимости по углу (для B85)
+    pb85 = pulls[pulls.tier == "B85"]
+    pd.concat([applicability_angle(pb85, model=m)
+               for m in ("reyna", "shukla", "bogdanova", "tang")],
+              ignore_index=True).to_csv(
+        os.path.join(a.out, "applicability_angle.csv"), index=False)
+
+    # Лестница свободы для всех моделей С и В, для А только gaisser и tang
+    lad = pd.concat([freedom_ladder(datasets, t) for t in ("C", "B")] +
+                    [freedom_ladder(datasets, "A", models=("gaisser", "tang"))],
+                    ignore_index=True)
+    lad.to_csv(os.path.join(a.out, "freedom_ladder.csv"), index=False)
+    summ = ladder_summary(lad)
+    summ.to_csv(os.path.join(a.out, "ladder_summary.csv"), index=False)
+    print("\nлестница свободы, выборка C (медиана χ²/dof):")
+    print(summ[summ.tier == "C"].to_string(index=False))
+
+    # Преобразует таблицу
+    wide = lad.pivot_table(index=["tier", "model", "dataset", "theta"],
+                           columns="stage", values="chi2_dof").reset_index()
+    wide["gain_norm"] = wide["frozen"] / wide["norm"]
+    wide["gain_shape"] = wide["norm"] / wide["free"]
+    wide.to_csv(os.path.join(a.out, "ladder_wide.csv"), index=False)
+
+    # Сводка нормировочного множителя s (ступень "norm" лестницы
+    # свободы) по модели и выборке отбора: медиана, размах.
+    rows = []
+    for (tier, mod), h in lad[lad.stage == "norm"].groupby(["tier", "model"]):
+        rows.append(dict(tier=tier, model=mod, k=len(h),
+                         s_med=h.scale.median(), s_min=h.scale.min(),
+                         s_max=h.scale.max(),
+                         spread=h.scale.max() / h.scale.min()))
+    pd.DataFrame(rows).to_csv(
+        os.path.join(a.out, "norm_factors.csv"), index=False)
+
+    # профили отношения модель/эксперимент для замороженных форм
+    frozen_bias(datasets, "C", by="angle").to_csv(
+        os.path.join(a.out, "frozen_bias_angle.csv"), index=False)
+    frozen_bias(datasets, "C", by="momentum").to_csv(
+        os.path.join(a.out, "frozen_bias_momentum.csv"), index=False)
+
+    # подгоночные параметры трёх форм против угла (выборка отбора C)
+    param_table(datasets, "C").to_csv(
+        os.path.join(a.out, "param_values.csv"), index=False)
+
+    # второй опубликованный набор Шуклы (наклонный) наравне с вертикальным
+    rows = []
+    for ds in select(datasets, "B"):
+        for tag, pars in (("theta0", M.PUBLISHED["shukla"]),
+                          ("theta75", M.SHUKLA_PUBLISHED_75)):
+            r = eval_frozen(ds, "shukla", pars)
+            if r:
+                rows.append(dict(dataset=ds["name"], theta=ds["theta"],
+                                 param_set=tag, chi2_n=r["chi2_dof"]))
+    pd.DataFrame(rows).to_csv(
+        os.path.join(a.out, "shukla_two_published_sets.csv"), index=False)
+
+    # проверка приведения единиц нормировки Шуклы
+    shukla_unit_check(datasets).to_csv(
+        os.path.join(a.out, "shukla_unit_check.csv"), index=False)
+
+    print(f"\nзаписано в {a.out}/")
+
+
+if __name__ == "__main__":
+    main()
